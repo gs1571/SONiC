@@ -12,6 +12,7 @@
   - [Interface Configuration](#interface-configuration)
   - [Operational Commands](#operational-commands)
 - [Configuration Example](#configuration-example)
+- [Default-instance IS-IS/SRv6 persistence](#default-instance-is-issrv6-persistence)
 - [Warm reboot, upgrade and restrictions](#warm-reboot-upgrade-and-restrictions)
 - [Test plan](#test-plan)
 - [References](#references)
@@ -113,9 +114,11 @@ field is omitted and its default applies. CLI reset operations enforce this too.
   `[no] hostname dynamic`, never the global hostname command.
 - `ipv6_multi_topology=true` renders `topology ipv6-unicast`; false removes that
   topology to allow single-topology IPv6 peers. `ipv6_enabled` controls the
-  interface's `ipv6 router isis` binding independently. IPv4 bindings remain
-  enabled on administratively enabled interfaces. These optional fields are
-  configured through ConfigDB; this CLI revision does not add dedicated commands.
+  interface's `ipv6 router isis` binding independently. The base IS-IS
+  implementation enables IPv4 on administratively enabled interfaces; the
+  [persistence profile](#default-instance-is-issrv6-persistence) also uses the
+  independent `ipv4_enabled` field. These fields are configured through ConfigDB;
+  this CLI revision does not add dedicated commands.
 - Enabling an interface immediately applies `ip router isis <vrf>` and, by default,
   `ipv6 router isis <vrf>`. The interface VRF comes from its routed interface table.
   Disabled interfaces and interfaces without an enabled global row are not bound.
@@ -209,6 +212,77 @@ show isis neighbor
 show isis database
 ```
 
+### Default-instance IS-IS/SRv6 persistence
+
+This extension requires an image with the
+[IS-IS/SRv6 persistence implementation](https://github.com/sonic-net/sonic-buildimage/pull/30607).
+The example uses unified FRR with template-based restore in the default routing
+namespace and one IS-IS instance in the default VRF. It does not extend recovery
+to named VRFs or per-ASIC namespaces.
+
+CONFIG_DB is the source of desired configuration. The example below shows
+the rows to add through the SONiC configuration workflow on a lab switch. It is
+a fragment, not a replacement for the switch configuration. It assumes an
+existing routed `Loopback0` in the default VRF and an unused NET, locator and SID.
+The passive IPv6 binding does not form adjacencies. On an image with independent
+address-family bindings, `ipv4_enabled=false` leaves IPv4 IS-IS disabled on that
+interface. The example does not require dedicated SRv6 commands in the IS-IS CLI.
+
+```json
+{
+  "SRV6_MY_LOCATORS": {
+    "ISIS_PERSIST_TEST": {
+      "prefix": "2001:db8:100::/48",
+      "behavior": "usid",
+      "format": "usid-f3216"
+    }
+  },
+  "ISIS_GLOBALS": {
+    "default": {
+      "enabled": "true",
+      "net_title": "49.0001.0000.0000.0001.00",
+      "level": "level-2",
+      "srv6_locator": "ISIS_PERSIST_TEST",
+      "srv6_interface": "Loopback0"
+    }
+  },
+  "ISIS_INTERFACE": {
+    "Loopback0": {
+      "enabled": "true",
+      "ipv4_enabled": "false",
+      "ipv6_enabled": "true",
+      "passive": "true",
+      "metric": "20"
+    }
+  },
+  "SRV6_MY_SIDS": {
+    "ISIS_PERSIST_TEST|2001:db8:100:a::/128": {
+      "action": "uN"
+    }
+  }
+}
+```
+
+`srv6_locator` and `srv6_interface` are configured together and reference
+existing objects. The static SID key combines the locator name and SID prefix.
+After checking the applied configuration in FRR, run `sudo config save -y`
+to write live CONFIG_DB to `/etc/sonic/config_db.json`. This saved file is the
+input for configuration reload and cold boot. FRR's `write memory` does not
+save SONiC CONFIG_DB.
+
+At startup, SONiC renders the IS-IS/SRv6 profile from CONFIG_DB for FRR. If
+canonical rendering fails, the independent fallback can start routing without
+that profile; BGP startup alone does not prove IS-IS/SRv6 recovery. When
+`frrcfgd` starts, it reads the live CONFIG_DB and compares it with FRR's running
+configuration. Matching state can be adopted without removing and recreating
+it. If rows changed or were deleted while the daemon was stopped, it reconciles
+the managed configuration. A persistent ownership journal lets it identify
+previously managed objects after deletion without treating every native FRR
+object as owned by SONiC.
+
+See [the persistence test cases](IS-IS-Test-Plan.md#default-instance-is-issrv6-persistence)
+for the expected FRR configuration and checks after each recovery event.
+
 ### Warm reboot, upgrade and restrictions
 
 Configuration must be saved with the existing `config save` workflow to persist.
@@ -218,6 +292,8 @@ preservation; these behaviors must not be advertised as supported without
 end-to-end validation. An upgrade must install the matching utilities and
 buildimage changes. Before downgrading to a schema without IS-IS, disable and
 remove the three IS-IS tables from saved configuration.
+If downgrading from the persistence extension, also remove its unsupported SRv6
+fields and restore a configuration compatible with the target image.
 
 The feature requires an FRR build containing isisd and the management-framework
 mode. No new hardware-specific APIs are required. Adjacency count, LSDB size,
